@@ -31,6 +31,12 @@ from datetime import datetime
 from typing import Optional
 
 # ============================================================
+# 立即关闭 Python 输出缓冲（Docker 场景下日志延迟的关键）
+# ============================================================
+sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, "reconfigure") else None
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+# ============================================================
 # 依赖自检（启动时检查，给出明确修复指引）
 # ============================================================
 _MISSING_DEPS = []
@@ -462,15 +468,20 @@ class Monitor:
         self.futu = FutuClient()
         self.last_alert_time: dict[str, float] = {}  # code -> last alert timestamp
 
-    def run_once(self) -> list[PremiumResult]:
+    def run_once(self, verbose: bool = True) -> list[PremiumResult]:
         """执行一次检测"""
         codes = [item["code"] for item in self.monitor_list]
-        logger.info(f"开始检测 {len(codes)} 个标的: {codes}")
+        msg = f"🔍 开始检测 {len(codes)} 个标的: {codes}"
+        logger.info(msg)
+        if verbose:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
         try:
             snapshots = self.futu.get_snapshots(codes)
         except Exception as e:
             logger.error(f"获取快照失败: {e}")
+            if verbose:
+                print(f"  ❌ 行情连接失败: {e}", flush=True)
             return [
                 PremiumResult(
                     code=item["code"], name=item["name"],
@@ -502,27 +513,43 @@ class Monitor:
             result = self.calculator.calculate(code, name, row, item)
             results.append(result)
             logger.info(result.summary())
+            # 每个标的的结果都实时打印到 stdout
+            icon = "⚠️" if result.is_alert else "  "
+            print(f"  {icon} {result.summary()}", flush=True)
 
+        print("", flush=True)  # 空行分隔
         return results
 
     def send_alerts(self, results: list[PremiumResult]):
         """发送告警通知"""
         alert_results = [r for r in results if r.is_alert and not r.error]
         if alert_results:
+            print(f"  📤 发送飞书通知（{len(alert_results)} 个告警标的）...", flush=True)
             self.notifier.send(results)
         else:
-            logger.info("本次检测无告警")
+            msg = "本次检测无告警"
+            logger.info(msg)
+            print(f"  ✅ {msg}", flush=True)
 
     def run_loop(self, interval: int = 60):
         """循环监控模式"""
-        logger.info(f"启动循环监控，间隔 {interval} 秒，按 Ctrl+C 停止")
+        msg = f"🚀 启动循环监控，间隔 {interval} 秒，按 Ctrl+C 停止"
+        logger.info(msg)
+        print(f"\n{'=' * 60}")
+        print(msg)
+        print(f"{'=' * 60}\n", flush=True)
+
+        cycle = 0
         try:
             while True:
+                cycle += 1
+                print(f"--- 第 {cycle} 轮检测 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ---", flush=True)
                 results = self.run_once()
                 self.send_alerts(results)
-                logger.info(f"等待 {interval} 秒后进行下一次检测...\n")
+                print(f"💤 等待 {interval} 秒后进行第 {cycle + 1} 轮检测...\n", flush=True)
                 time.sleep(interval)
         except KeyboardInterrupt:
+            print(f"\n🛑 监控已停止，共执行 {cycle} 轮检测", flush=True)
             logger.info("监控已停止")
         finally:
             self.futu.close()

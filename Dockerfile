@@ -12,8 +12,9 @@ LABEL org.opencontainers.image.description="LOF/ETF 溢价率实时监控，通�
 LABEL org.opencontainers.image.source="https://github.com/hushenshen/fund-monitor"
 LABEL org.opencontainers.image.authors="hushenshen"
 
-# 设置时区
-ENV TZ=Asia/Shanghai
+# 关闭 Python 输出缓冲 + 时区
+ENV PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 安装系统依赖
