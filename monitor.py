@@ -313,14 +313,21 @@ class FutuClient:
     def __exit__(self, *args):
         self.close()
 
+    @staticmethod
+    def _normalize_code(code: str) -> str:
+        """去掉市场前缀，只保留数字部分，用于模糊匹配"""
+        return code.split(".")[-1] if "." in code else code
+
     def get_snapshots(self, codes: list[str]) -> dict:
         """
         批量获取市场快照。
         返回 {code: DataFrame row} 的字典。
+
+        注意：富途返回的 code 字段可能不带市场前缀（如 160644），
+        因此同时用完整码和短码作为 key，确保后续 lookup 能命中。
         """
         ctx = self.connect()
         result = {}
-        # 分批请求，每批最多 400 个
         batch_size = 400
         for i in range(0, len(codes), batch_size):
             batch = codes[i:i + batch_size]
@@ -328,11 +335,15 @@ class FutuClient:
             if ret != RET_OK:
                 logger.error(f"获取快照失败: {data}")
                 continue
-            if data is not None and len(data) > 0:
+            if data is not None and not data.empty:
                 for idx in range(len(data)):
                     row = data.iloc[idx]
-                    code = str(row.get("code", ""))
-                    result[code] = row
+                    raw_code = str(row.get("code", ""))
+                    short_code = self._normalize_code(raw_code)
+                    # 同时以完整码和短码存储，覆盖不同查询方式
+                    result[raw_code] = row
+                    if short_code != raw_code:
+                        result.setdefault(short_code, row)
         return result
 
 
@@ -578,6 +589,8 @@ class Monitor:
 
         try:
             snapshots = self.futu.get_snapshots(codes)
+            if verbose:
+                print(f"  快照返回 {len(snapshots)} 条数据 (keys: {list(snapshots.keys())[:3]})", flush=True)
         except Exception as e:
             logger.error(f"获取快照失败: {e}")
             if verbose:
@@ -594,11 +607,21 @@ class Monitor:
                 for item in self.monitor_list
             ]
 
+        if not snapshots:
+            msg = "快照数据为空，请检查 OpenD 连接和目标代码是否有效"
+            logger.warning(msg)
+            if verbose:
+                print(f"  !! {msg}", flush=True)
+
         results = []
         for item in self.monitor_list:
             code = item["code"]
             name = item["name"]
+            # 先用完整码查找，再用短码兜底
             row = snapshots.get(code)
+            if row is None:
+                short_code = code.split(".")[-1] if "." in code else code
+                row = snapshots.get(short_code)
 
             if row is None:
                 r = PremiumResult(
@@ -606,7 +629,7 @@ class Monitor:
                     threshold=item.get("threshold", 2.0),
                     last_price=0, ref_nav=0, nav_field="",
                     premium_pct=0, is_alert=False, update_time="",
-                    error="未获取到快照数据",
+                    error=f"未获取到快照数据 (可用keys: {list(snapshots.keys())[:5]})",
                 )
                 results.append(r)
                 for line in r.detail_lines():
