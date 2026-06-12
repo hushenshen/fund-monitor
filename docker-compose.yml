@@ -1,0 +1,53 @@
+version: "3.8"
+
+# ============================================================
+# fund-monitor — Docker Compose 部署
+# ============================================================
+#
+# 前置条件：
+#   宿主机需要运行 OpenD 客户端（默认在 host.docker.internal:11111）
+#
+# 使用方式：
+#   docker-compose up -d                # 后台启动（默认60秒循环）
+#   docker-compose run --rm monitor --loop 120  # 120秒间隔
+#   docker-compose down                 # 停止
+# ============================================================
+
+services:
+  monitor:
+    image: deeplakehss/fund-monitor:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fund-monitor
+    restart: unless-stopped
+
+    # 循环监控模式，每60秒检测一次
+    command: ["--loop", "60"]
+
+    environment:
+      # 飞书 Webhook 地址（可选，脚本内置了默认值）
+      # FEISHU_WEBHOOK_URL: "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+
+      # OpenD 连接（Docker 内部通过 host.docker.internal 访问宿主机的 OpenD）
+      FUTU_OPEND_HOST: "host.docker.internal"
+      FUTU_OPEND_PORT: "11111"
+
+      # Python 日志输出不缓冲（Docker 日志实时可见）
+      PYTHONUNBUFFERED: "1"
+
+    # 使用 host 网络模式可以解决 host.docker.internal 在某些环境不可用的问题
+    # network_mode: host
+
+    # 日志轮转
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 内存限制
+    deploy:
+      resources:
+        limits:
+          memory: 256M
