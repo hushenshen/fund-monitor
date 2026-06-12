@@ -74,64 +74,58 @@ logging.basicConfig(
 logger = logging.getLogger("fund_monitor")
 
 # ============================================================
-# 配置区域 —— 在此修改监控列表和通知设置
+# 配置文件加载
 # ============================================================
 
-# 飞书机器人 Webhook 地址
-# 可通过环境变量 FEISHU_WEBHOOK_URL 覆盖
-FEISHU_WEBHOOK_URL = os.environ.get(
-    "FEISHU_WEBHOOK_URL",
-    "XXX",
-)
+def _load_config_file(path: str) -> dict:
+    """加载 JSON 配置文件，返回 {webhook_url, monitor_list}"""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"配置文件不存在: {path}")
 
-# 监控标的列表
-# 每个条目字段说明：
-#   code:      富途股票代码（A 股深市 SZ.xxxxxx，沪市 SH.xxxxxx）
-#   name:      标的名称（飞书通知中显示）
-#   threshold: 溢价率阈值（%），当前溢价率 < 此值时触发通知
-#   type:      类型，"LOF" 或 "ETF"
-#   nav_field: 净值来源（见下方说明）
-#
-# 溢价率计算公式：
-#   溢价率 = (实时交易价 / 参考净值 - 1) × 100%
-#   正值 = 溢价（市场价高于净值），负值 = 折价（市场价低于净值）
-#
-# nav_field 取值说明：
-#   "prev_close" : 使用昨日收盘价作为参考净值（默认，适用于无 IOPV 数据的 LOF）
-#   "nav"         : 使用基金净值（需富途提供该字段）
-#   "iopv"        : 使用盘中实时参考净值 IOPV（最准确，需数据源支持）
-#
-MONITOR_LIST = [
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    if "monitor_list" not in cfg or not isinstance(cfg["monitor_list"], list):
+        raise ValueError("配置文件缺少 monitor_list 字段或格式错误")
+
+    return cfg
+
+
+def _resolve_config_path(cli_arg: str = None) -> str:
+    """
+    按优先级确定配置文件路径：
+    1. 命令行 --config 参数
+    2. 环境变量 MONITOR_CONFIG_FILE
+    3. 默认: 脚本同目录下的 config.json
+    """
+    if cli_arg:
+        return cli_arg
+    env_path = os.environ.get("MONITOR_CONFIG_FILE")
+    if env_path:
+        return env_path
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+# ============================================================
+# 配置区域 —— 可通过 config.json 覆盖，修改后无需重新打镜像
+# ============================================================
+
+# 默认值（config.json 不存在时的兜底）
+DEFAULT_WEBHOOK_URL = "XXX"
+
+DEFAULT_MONITOR_LIST = [
     {
         "code": "SZ.160644",
         "name": "鹏华港美互联网LOF",
         "threshold": 2.0,
         "type": "LOF",
-        "nav_field": "prev_close",  # 默认用昨收；如有 NAV 数据可改为 "nav"
+        "nav_field": "prev_close",
     },
-    # ===== 扩展示例（取消注释即可生效）=====
-    # {
-    #     "code": "SZ.161128",
-    #     "name": "易方达标普信息科技LOF",
-    #     "threshold": 3.0,
-    #     "type": "LOF",
-    #     "nav_field": "prev_close",
-    # },
-    # {
-    #     "code": "SZ.164824",
-    #     "name": "工银印度基金LOF",
-    #     "threshold": 2.5,
-    #     "type": "LOF",
-    #     "nav_field": "prev_close",
-    # },
-    # {
-    #     "code": "SH.513050",
-    #     "name": "易方达中概互联ETF",
-    #     "threshold": 2.0,
-    #     "type": "ETF",
-    #     "nav_field": "prev_close",
-    # },
 ]
+
+# 以下变量在 main() 中通过 load_config() 最终赋值
+FEISHU_WEBHOOK_URL = DEFAULT_WEBHOOK_URL
+MONITOR_LIST = DEFAULT_MONITOR_LIST
 
 # OpenD 连接配置
 OPEND_HOST = os.environ.get("FUTU_OPEND_HOST", "127.0.0.1")
@@ -564,13 +558,25 @@ def main():
         description="LOF/ETF 溢价率实时监控",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+配置文件 (config.json) 示例:
+  {
+    "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx",
+    "monitor_list": [
+      {"code":"SZ.160644","name":"鹏华港美互联网LOF","threshold":2.0,"type":"LOF","nav_field":"prev_close"},
+      {"code":"SH.513050","name":"易方达中概互联ETF","threshold":2.0,"type":"ETF","nav_field":"prev_close"}
+    ]
+  }
+
 使用示例:
-  python monitor.py                # 单次检测并发送通知
-  python monitor.py --loop 60      # 每60秒循环检测
-  python monitor.py --json         # JSON 格式输出（不发送通知）
-  python monitor.py --no-notify    # 只检测不发通知
-  python monitor.py --json --no-notify  # JSON输出也不发通知
+  python monitor.py                      # 单次检测（使用默认 config.json）
+  python monitor.py --config my.json     # 指定配置文件
+  python monitor.py --loop 60            # 每60秒循环检测
+  python monitor.py --json --no-notify   # JSON输出，不发通知
         """,
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="配置文件路径（JSON 格式，默认: 脚本同目录 config.json）",
     )
     parser.add_argument(
         "--loop", type=int, default=0,
@@ -586,10 +592,30 @@ def main():
     )
     parser.add_argument(
         "--webhook", type=str, default=None,
-        help="飞书 Webhook URL（覆盖默认配置）",
+        help="飞书 Webhook URL（覆盖配置文件中的值）",
     )
     args = parser.parse_args()
 
+    # ---- 加载配置文件 ----
+    global FEISHU_WEBHOOK_URL, MONITOR_LIST
+
+    config_path = _resolve_config_path(args.config)
+    try:
+        cfg = _load_config_file(config_path)
+        MONITOR_LIST = cfg["monitor_list"]
+        FEISHU_WEBHOOK_URL = cfg.get("webhook_url", DEFAULT_WEBHOOK_URL)
+        print(f"📄 已加载配置文件: {config_path}（{len(MONITOR_LIST)} 个标的）", flush=True)
+    except FileNotFoundError:
+        print(f"⚠️  配置文件不存在: {config_path}，使用内置默认配置", flush=True)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"⚠️  配置文件解析失败: {e}，使用内置默认配置", flush=True)
+
+    # 环境变量覆盖 webhook（最高优先级）
+    webhook_env = os.environ.get("FEISHU_WEBHOOK_URL")
+    if webhook_env:
+        FEISHU_WEBHOOK_URL = webhook_env
+
+    # 命令行 --webhook 覆盖（最高优先级）
     webhook = args.webhook or FEISHU_WEBHOOK_URL
 
     monitor = Monitor(webhook_url=webhook if not args.no_notify else "")
