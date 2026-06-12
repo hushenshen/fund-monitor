@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """
-LOF/ETF 婧环鐜囧疄鏃剁洃鎺ц剼鏈?============================
-閫氳繃瀵岄€?OpenAPI 鑾峰彇瀹炴椂琛屾儏锛岃绠楁孩浠风巼锛屼綆浜庨槇鍊兼椂閫氳繃椋炰功 Webhook 鍙戦€侀€氱煡銆?
-渚濊禆锛?    pip install futu-api requests
+LOF/ETF 溢价率实时监控脚本
+============================
+通过富途 OpenAPI 获取实时行情，计算溢价率，低于阈值时通过飞书 Webhook 发送通知。
 
-鐜瑕佹眰锛?    - OpenD 蹇呴』杩愯锛岄粯璁よ繛鎺?127.0.0.1:11111
-    - 鍙€氳繃鐜鍙橀噺 FUTU_OPEND_HOST / FUTU_OPEND_PORT 淇敼
+依赖：
+    pip install futu-api requests pyyaml
 
-浣跨敤鏂瑰紡锛?    python monitor.py              # 鍗曟妫€娴?    python monitor.py --loop 60    # 姣?0绉掕疆璇竴娆★紙Ctrl+C 鍋滄锛?    python monitor.py --json       # JSON 鏍煎紡杈撳嚭锛堜笉鍙戦€侀€氱煡锛?
-鎵╁睍鏂瑰紡锛?    淇敼涓嬫柟 MONITOR_LIST锛屾坊鍔犳洿澶?LOF/ETF 鏍囩殑鍗冲彲銆?"""
+环境要求：
+    - OpenD 必须运行，默认连接 127.0.0.1:11111
+    - 可通过环境变量 FUTU_OPEND_HOST / FUTU_OPEND_PORT 修改
+
+使用方式：
+    python monitor.py              # 单次检测
+    python monitor.py --loop 60    # 每60秒轮询一次（Ctrl+C 停止）
+    python monitor.py --json       # JSON 格式输出（不发送通知）
+
+扩展方式：
+    修改 config.yml，添加更多 LOF/ETF 标的即可，无需重新构建 Docker 镜像。
+"""
 
 import argparse
 import json
@@ -21,12 +31,14 @@ from datetime import datetime
 from typing import Optional
 
 # ============================================================
-# 绔嬪嵆鍏抽棴 Python 杈撳嚭缂撳啿锛圖ocker 鍦烘櫙涓嬫棩蹇楀欢杩熺殑鍏抽敭锛?# ============================================================
+# 立即关闭 Python 输出缓冲（Docker 场景下日志延迟的关键）
+# ============================================================
 sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, "reconfigure") else None
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 # ============================================================
-# 渚濊禆鑷锛堝惎鍔ㄦ椂妫€鏌ワ紝缁欏嚭鏄庣‘淇鎸囧紩锛?# ============================================================
+# 依赖自检（启动时检查，给出明确修复指引）
+# ============================================================
 _MISSING_DEPS = []
 for _mod, _pkg in [("futu", "futu-api"), ("requests", "requests"), ("yaml", "pyyaml")]:
     try:
@@ -36,9 +48,9 @@ for _mod, _pkg in [("futu", "futu-api"), ("requests", "requests"), ("yaml", "pyy
 
 if _MISSING_DEPS:
     print(
-        f"[ERROR] 缂哄皯渚濊禆: {', '.join(_mod for _mod, _pkg in [('futu','futu-api'),('requests','requests')] if _mod not in sys.modules)}\n"
-        f"璇蜂娇鐢ㄤ互涓嬪懡浠ゅ畨瑁?\n"
-        f"  {sys.executable} -m pip install futu-api requests\n",
+        f"[ERROR] 缺少依赖: {', '.join(_mod for _mod, _pkg in [('futu','futu-api'),('requests','requests')] if _mod not in sys.modules)}\n"
+        f"请使用以下命令安装:\n"
+        f"  {sys.executable} -m pip install futu-api requests pyyaml\n",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -53,7 +65,7 @@ from futu import (  # noqa: E402
 )
 
 # ============================================================
-# 鏃ュ織閰嶇疆
+# 日志配置
 # ============================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -63,16 +75,16 @@ logging.basicConfig(
 logger = logging.getLogger("fund_monitor")
 
 # ============================================================
-# 浠ｇ爜鑷姩璇嗗埆锛氬彧杈?6 浣嶄唬鐮侊紝鑷姩鍒ゆ柇 SZ/SH 鍜?LOF/ETF
+# 代码自动识别：只输 6 位代码，自动判断 SZ/SH 和 LOF/ETF
 # ============================================================
 
 def _is_sh(code: str) -> bool:
-    """鍒ゆ柇 A 鑲′唬鐮佹槸鍚︿负娌競銆?xxxxx 鈫?娌競锛屽叾浣?鈫?娣卞競"""
+    """判断 A 股代码是否为沪市。6xxxxx → 沪市，其余 → 深市"""
     return code.startswith("6")
 
 
 def _is_etf(code: str) -> bool:
-    """鍒ゆ柇鍩洪噾浠ｇ爜鏄惁涓?ETF锛堝惁鍒欒涓?LOF锛?""
+    """判断基金代码是否为 ETF（否则视为 LOF）"""
     sh_etf_prefixes = ("510", "511", "512", "513", "515", "516", "517", "518", "588")
     sz_etf_prefixes = ("159",)
     return code.startswith(sh_etf_prefixes + sz_etf_prefixes)
@@ -80,12 +92,13 @@ def _is_etf(code: str) -> bool:
 
 def _auto_detect(code: str) -> dict:
     """
-    鏍规嵁 6 浣嶄唬鐮佽嚜鍔ㄦ帹鏂瘜閫斿畬鏁翠唬鐮佸拰鍩洪噾绫诲瀷銆?
-    杩斿洖: {"futu_code": "SZ.160644", "market": "SZ", "type": "LOF", "name": ""}
+    根据 6 位代码自动推断富途完整代码和基金类型。
+
+    返回: {"futu_code": "SZ.160644", "market": "SZ", "type": "LOF", "name": ""}
     """
     code = str(code).strip()
     if "." in code:
-        # 宸茬粡鏄畬鏁村瘜閫斾唬鐮侊紝涓嶅仛鑷姩鎺ㄦ柇
+        # 已经是完整富途代码，不做自动推断
         futu_code = code
         market = code.split(".")[0]
     else:
@@ -99,17 +112,20 @@ def _auto_detect(code: str) -> dict:
 
 def _normalize_item(item) -> dict:
     """
-    灏嗛厤缃潯鐩爣鍑嗗寲涓哄畬鏁存牸寮忋€?
-    鏀寔涓夌鍐欐硶锛?      1. 绾唬鐮佸瓧绗︿覆: "160644"
-      2. 甯﹀悕绉扮殑瀛楀吀: {"code": "160644", "name": "楣忓崕娓編浜掕仈缃慙OF"}
-      3. 瀹屾暣瀛楀吀:     {"code": "SZ.160644", "type": "LOF", ...}
+    将配置条目标准化为完整格式。
 
-    杩斿洖瀹屾暣鏍煎紡瀛楀吀锛屾湭濉瓧娈电敤鑷姩鎺ㄦ柇缁撴灉 + 榛樿鍊艰ˉ榻愩€?    """
+    支持三种写法：
+      1. 纯代码字符串: "160644"
+      2. 带名称的字典: {"code": "160644", "name": "鹏华港美互联网LOF"}
+      3. 完整字典:     {"code": "SZ.160644", "type": "LOF", ...}
+
+    返回完整格式字典，未填字段用自动推断结果 + 默认值补齐。
+    """
     if isinstance(item, str):
         item = {"code": item}
 
     if not isinstance(item, dict) or "code" not in item:
-        raise ValueError(f"閰嶇疆鏉＄洰鏍煎紡閿欒: {item}")
+        raise ValueError(f"配置条目格式错误: {item}")
 
     detected = _auto_detect(item["code"])
 
@@ -123,13 +139,13 @@ def _normalize_item(item) -> dict:
 
 
 # ============================================================
-# 閰嶇疆鏂囦欢鍔犺浇
+# 配置文件加载
 # ============================================================
 
 def _load_config_file(path: str) -> dict:
-    """鍔犺浇 YAML/JSON 閰嶇疆鏂囦欢锛岃繑鍥?{webhook_url, monitor_list}"""
+    """加载 YAML/JSON 配置文件，返回 {webhook_url, monitor_list}"""
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"閰嶇疆鏂囦欢涓嶅瓨鍦? {path}")
+        raise FileNotFoundError(f"配置文件不存在: {path}")
 
     with open(path, "r", encoding="utf-8") as f:
         if path.endswith((".yml", ".yaml")):
@@ -138,11 +154,11 @@ def _load_config_file(path: str) -> dict:
             cfg = json.load(f)
 
     if cfg is None:
-        raise ValueError("閰嶇疆鏂囦欢涓虹┖")
+        raise ValueError("配置文件为空")
     if "monitor_list" not in cfg or not isinstance(cfg["monitor_list"], list):
-        raise ValueError("閰嶇疆鏂囦欢缂哄皯 monitor_list 瀛楁鎴栨牸寮忛敊璇?)
+        raise ValueError("配置文件缺少 monitor_list 字段或格式错误")
 
-    # 鏍囧噯鍖栨墍鏈夋潯鐩紙鑷姩鎺ㄦ柇 SZ/SH銆丩OF/ETF锛岃ˉ榻愰粯璁ゅ€硷級
+    # 标准化所有条目（自动推断 SZ/SH、LOF/ETF，补齐默认值）
     cfg["monitor_list"] = [_normalize_item(item) for item in cfg["monitor_list"]]
 
     return cfg
@@ -150,9 +166,10 @@ def _load_config_file(path: str) -> dict:
 
 def _resolve_config_path(cli_arg: str = None) -> str:
     """
-    鎸変紭鍏堢骇纭畾閰嶇疆鏂囦欢璺緞锛?    1. 鍛戒护琛?--config 鍙傛暟
-    2. 鐜鍙橀噺 MONITOR_CONFIG_FILE
-    3. 榛樿: 鑴氭湰鍚岀洰褰曚笅鐨?config.yml 鈫?config.yaml 鈫?config.json
+    按优先级确定配置文件路径：
+    1. 命令行 --config 参数
+    2. 环境变量 MONITOR_CONFIG_FILE
+    3. 默认: 脚本同目录下的 config.yml → config.yaml → config.json
     """
     if cli_arg:
         return cli_arg
@@ -164,106 +181,112 @@ def _resolve_config_path(cli_arg: str = None) -> str:
         candidate = os.path.join(base, name)
         if os.path.isfile(candidate):
             return candidate
-    return os.path.join(base, "config.yml")  # 榛樿鍚?
+    return os.path.join(base, "config.yml")  # 默认名
+
 
 # ============================================================
-# 閰嶇疆鍖哄煙 鈥斺€?鍙€氳繃 config.json 瑕嗙洊锛屼慨鏀瑰悗鏃犻渶閲嶆柊鎵撻暅鍍?# ============================================================
+# 配置区域 —— 可通过 config.yml 覆盖，修改后无需重新打镜像
+# ============================================================
 
-# 榛樿鍊硷紙config.json 涓嶅瓨鍦ㄦ椂鐨勫厹搴曪級
+# 默认值（config.yml 不存在时的兜底）
 DEFAULT_WEBHOOK_URL = "XXX"
 
 DEFAULT_MONITOR_LIST = [
     {
         "code": "SZ.160644",
-        "name": "楣忓崕娓編浜掕仈缃慙OF",
+        "name": "鹏华港美互联网LOF",
         "threshold": 2.0,
         "type": "LOF",
         "nav_field": "prev_close",
     },
 ]
 
-# 浠ヤ笅鍙橀噺鍦?main() 涓€氳繃 load_config() 鏈€缁堣祴鍊?FEISHU_WEBHOOK_URL = DEFAULT_WEBHOOK_URL
+# 以下变量在 main() 中通过 load_config() 最终赋值
+FEISHU_WEBHOOK_URL = DEFAULT_WEBHOOK_URL
 MONITOR_LIST = DEFAULT_MONITOR_LIST
 
-# OpenD 杩炴帴閰嶇疆
+# OpenD 连接配置
 OPEND_HOST = os.environ.get("FUTU_OPEND_HOST", "127.0.0.1")
 OPEND_PORT = int(os.environ.get("FUTU_OPEND_PORT", "11111"))
 
 
 # ============================================================
-# 鏁版嵁妯″瀷
+# 数据模型
 # ============================================================
 
 @dataclass
 class PremiumResult:
-    """鍗曞彧鏍囩殑鐨勬孩浠风巼妫€娴嬬粨鏋?""
+    """单只标的的溢价率检测结果"""
     code: str
     name: str
     fund_type: str
     threshold: float
-    last_price: float          # 瀹炴椂浜ゆ槗浠?    ref_nav: float             # 鍙傝€冨噣鍊硷紙鏄ㄦ敹/NAV/IOPV锛?    nav_field: str             # 浣跨敤浜嗗摢涓噣鍊煎瓧娈?    premium_pct: float         # 婧环鐜?(%)
-    is_alert: bool             # 鏄惁婊¤冻鍛婅鏉′欢
-    update_time: str           # 琛屾儏鏇存柊鏃堕棿
+    last_price: float          # 实时交易价
+    ref_nav: float             # 参考净值（昨收/NAV/IOPV）
+    nav_field: str             # 使用了哪个净值字段
+    premium_pct: float         # 溢价率 (%)
+    is_alert: bool             # 是否满足告警条件
+    update_time: str           # 行情更新时间
     error: Optional[str] = None
 
     def premium_direction(self) -> str:
-        """婧环/鎶樹环鏂瑰悜"""
+        """溢价/折价方向"""
         if self.premium_pct > 0:
-            return "婧环"
+            return "溢价"
         elif self.premium_pct < 0:
-            return "鎶樹环"
-        return "骞充环"
+            return "折价"
+        return "平价"
 
     NAV_FIELD_LABELS = {
-        "prev_close": "鏄ㄦ敹浠?,
-        "nav": "鍩洪噾鍑€鍊?NAV)",
-        "iopv": "瀹炴椂鍙傝€冨噣鍊?IOPV)",
-        "": "鏈煡",
+        "prev_close": "昨收价",
+        "nav": "基金净值(NAV)",
+        "iopv": "实时参考净值(IOPV)",
+        "": "未知",
     }
 
     def summary(self) -> str:
-        """鍗曡鎽樿锛堟棩蹇楁枃浠剁敤锛?""
+        """单行摘要（日志文件用）"""
         if self.error:
-            return f"[{self.code} {self.name}] 閿欒: {self.error}"
-        flag = "鈿狅笍 瑙﹀彂" if self.is_alert else "鉁?姝ｅ父"
+            return f"[{self.code} {self.name}] 错误: {self.error}"
+        flag = "触发" if self.is_alert else "正常"
         direction = self.premium_direction()
         return (
             f"{flag} [{self.code}] {self.name} | "
-            f"鐜颁环: {self.last_price:.3f} | "
-            f"鍙傝€冨噣鍊?{self.nav_field}): {self.ref_nav:.4f} | "
-            f"婧环鐜? {self.premium_pct:+.2f}% ({direction}) | "
-            f"闃堝€? {self.threshold}% | "
-            f"鏇存柊鏃堕棿: {self.update_time}"
+            f"现价: {self.last_price:.3f} | "
+            f"参考净值({self.nav_field}): {self.ref_nav:.4f} | "
+            f"溢价率: {self.premium_pct:+.2f}% ({direction}) | "
+            f"阈值: {self.threshold}% | "
+            f"更新时间: {self.update_time}"
         )
 
     def detail_lines(self) -> list[str]:
-        """鐢熸垚澶氳璇︾粏淇℃伅锛堟帶鍒跺彴杈撳嚭鐢級"""
+        """生成多行详细信息（控制台输出用）"""
         if self.error:
-            return [f"  鉂?{self.name}锛坽self.code}锛夋煡璇㈠紓甯? {self.error}"]
+            return [f"  !! {self.name}（{self.code}）查询异常: {self.error}"]
 
         nav_label = self.NAV_FIELD_LABELS.get(self.nav_field, self.nav_field)
         direction = self.premium_direction()
         alert_line = ""
         if self.is_alert:
-            alert_line = f" 鈿狅笍 浣庝簬闃堝€?{self.threshold}%"
+            alert_line = f" ** 低于阈值 {self.threshold}%"
 
         lines = [
-            f"  鈹屸攢 {self.code}  {self.name}锛坽self.fund_type}锛?,
-            f"  鈹? 瀹炴椂浠锋牸     楼 {self.last_price:.3f}",
-            f"  鈹? 鍙傝€冨噣鍊?    楼 {self.ref_nav:.4f}锛坽nav_label}锛?,
-            f"  鈹? 婧环鐜?      {self.premium_pct:+.2f}%锛坽direction}锛墈alert_line}",
-            f"  鈹? 琛屾儏鏃堕棿     {self.update_time}",
-            f"  鈹斺攢",
+            f"  --- {self.code}  {self.name}（{self.fund_type}）",
+            f"  |   实时价格     {self.last_price:.3f}",
+            f"  |   参考净值     {self.ref_nav:.4f}（{nav_label}）",
+            f"  |   溢价率       {self.premium_pct:+.2f}%（{direction}）{alert_line}",
+            f"  |   行情时间     {self.update_time}",
+            f"  ---",
         ]
         return lines
 
 
 # ============================================================
-# 瀵岄€旇鎯呭鎴风
+# 富途行情客户端
 # ============================================================
 
 class FutuClient:
-    """灏佽瀵岄€?OpenAPI 琛屾儏杩炴帴"""
+    """封装富途 OpenAPI 行情连接"""
 
     def __init__(self, host: str = OPEND_HOST, port: int = OPEND_PORT):
         self.host = host
@@ -271,18 +294,18 @@ class FutuClient:
         self._ctx: Optional[OpenQuoteContext] = None
 
     def connect(self) -> OpenQuoteContext:
-        """寤虹珛琛屾儏杩炴帴"""
+        """建立行情连接"""
         if self._ctx is None:
             self._ctx = OpenQuoteContext(host=self.host, port=self.port)
-            logger.info(f"宸茶繛鎺?OpenD: {self.host}:{self.port}")
+            logger.info(f"已连接 OpenD: {self.host}:{self.port}")
         return self._ctx
 
     def close(self):
-        """鍏抽棴琛屾儏杩炴帴"""
+        """关闭行情连接"""
         if self._ctx is not None:
             self._ctx.close()
             self._ctx = None
-            logger.info("宸叉柇寮€ OpenD 杩炴帴")
+            logger.info("已断开 OpenD 连接")
 
     def __enter__(self):
         return self.connect()
@@ -292,15 +315,18 @@ class FutuClient:
 
     def get_snapshots(self, codes: list[str]) -> dict:
         """
-        鎵归噺鑾峰彇甯傚満蹇収銆?        杩斿洖 {code: DataFrame row} 鐨勫瓧鍏搞€?        """
+        批量获取市场快照。
+        返回 {code: DataFrame row} 的字典。
+        """
         ctx = self.connect()
         result = {}
-        # 鍒嗘壒璇锋眰锛屾瘡鎵规渶澶?400 涓?        batch_size = 400
+        # 分批请求，每批最多 400 个
+        batch_size = 400
         for i in range(0, len(codes), batch_size):
             batch = codes[i:i + batch_size]
             ret, data = ctx.get_market_snapshot(batch)
             if ret != RET_OK:
-                logger.error(f"鑾峰彇蹇収澶辫触: {data}")
+                logger.error(f"获取快照失败: {data}")
                 continue
             if data is not None and len(data) > 0:
                 for idx in range(len(data)):
@@ -311,19 +337,20 @@ class FutuClient:
 
 
 # ============================================================
-# 婧环鐜囪绠楀櫒
+# 溢价率计算器
 # ============================================================
 
 class PremiumCalculator:
     """
-    LOF/ETF 婧环鐜囪绠楀櫒
+    LOF/ETF 溢价率计算器
 
-    鏀寔涓夌鍑€鍊兼潵婧愶紙閫氳繃 nav_field 鎸囧畾锛夛細
-    - "prev_close": 浣跨敤鏄ㄦ棩鏀剁洏浠凤紙鏈€閫氱敤锛屼絾绮惧害鏈€宸級
-    - "nav": 浣跨敤鍩洪噾鍑€鍊硷紙闇€瀵岄€斿揩鐓у寘鍚瀛楁锛?    - "iopv": 浣跨敤鐩樹腑瀹炴椂鍙傝€冨噣鍊硷紙鏈€鍑嗙‘锛岄渶鏁版嵁婧愭敮鎸侊級
+    支持三种净值来源（通过 nav_field 指定）：
+    - "prev_close": 使用昨日收盘价（最通用，但精度最差）
+    - "nav": 使用基金净值（需富途快照包含此字段）
+    - "iopv": 使用盘中实时参考净值（最准确，需数据源支持）
     """
 
-    # 瀵岄€斿揩鐓т腑鍙兘鐨勫噣鍊煎瓧娈靛悕鏄犲皠
+    # 富途快照中可能的净值字段名映射
     NAV_FIELD_CANDIDATES = {
         "prev_close": ["prev_close_price", "pre_price", "last_close"],
         "nav": ["net_value", "nav", "fund_nav"],
@@ -332,11 +359,11 @@ class PremiumCalculator:
 
     @staticmethod
     def _extract_field(row, candidates: list[str]) -> float:
-        """浠庡揩鐓ц涓彁鍙栫涓€涓瓨鍦ㄧ殑鏁板€煎瓧娈?""
+        """从快照行中提取第一个存在的数值字段"""
         for field_name in candidates:
             try:
                 val = row.get(field_name, None)
-                if val is not None and not (isinstance(val, float) and val != val):  # 鎺掗櫎 NaN
+                if val is not None and not (isinstance(val, float) and val != val):  # 排除 NaN
                     f = float(val)
                     if f > 0:
                         return f
@@ -345,29 +372,30 @@ class PremiumCalculator:
         return 0.0
 
     def calculate(self, code: str, name: str, row, config: dict) -> PremiumResult:
-        """璁＄畻鍗曞彧鏍囩殑鐨勬孩浠风巼"""
+        """计算单只标的的溢价率"""
         fund_type = config.get("type", "LOF")
         threshold = config.get("threshold", 2.0)
         nav_field = config.get("nav_field", "prev_close")
 
         try:
-            # 鑾峰彇瀹炴椂浜ゆ槗浠锋牸
+            # 获取实时交易价格
             last_price = self._extract_field(row, ["last_price"])
             if last_price <= 0:
                 return PremiumResult(
                     code=code, name=name, fund_type=fund_type,
                     threshold=threshold, last_price=0, ref_nav=0,
                     nav_field=nav_field, premium_pct=0, is_alert=False,
-                    update_time="", error="鏃犳硶鑾峰彇浜ゆ槗浠锋牸"
+                    update_time="", error="无法获取交易价格"
                 )
 
-            # 鑾峰彇鍙傝€冨噣鍊?            candidates = self.NAV_FIELD_CANDIDATES.get(
+            # 获取参考净值
+            candidates = self.NAV_FIELD_CANDIDATES.get(
                 nav_field, self.NAV_FIELD_CANDIDATES["prev_close"]
             )
             ref_nav = self._extract_field(row, candidates)
 
             if ref_nav <= 0:
-                # 鍏滃簳锛氬鏋滄寚瀹氬瓧娈典笉鍙敤锛屽皾璇?prev_close
+                # 兜底：如果指定字段不可用，尝试 prev_close
                 ref_nav = self._extract_field(
                     row, self.NAV_FIELD_CANDIDATES["prev_close"]
                 )
@@ -380,14 +408,16 @@ class PremiumCalculator:
                     code=code, name=name, fund_type=fund_type,
                     threshold=threshold, last_price=last_price, ref_nav=0,
                     nav_field=actual_field, premium_pct=0, is_alert=False,
-                    update_time="", error="鏃犳硶鑾峰彇鍙傝€冨噣鍊?
+                    update_time="", error="无法获取参考净值"
                 )
 
-            # 璁＄畻婧环鐜?            premium_pct = (last_price / ref_nav - 1.0) * 100.0
+            # 计算溢价率
+            premium_pct = (last_price / ref_nav - 1.0) * 100.0
 
-            # 鍒ゆ柇鏄惁瑙﹀彂鍛婅锛氭孩浠风巼 < 闃堝€?            is_alert = premium_pct < threshold
+            # 判断是否触发告警：溢价率 < 阈值
+            is_alert = premium_pct < threshold
 
-            # 鑾峰彇鏇存柊鏃堕棿
+            # 获取更新时间
             update_time = (
                 str(row.get("update_time", ""))
                 if row.get("update_time")
@@ -411,42 +441,42 @@ class PremiumCalculator:
 
 
 # ============================================================
-# 椋炰功閫氱煡
+# 飞书通知
 # ============================================================
 
 class FeishuNotifier:
-    """椋炰功鏈哄櫒浜?Webhook 閫氱煡"""
+    """飞书机器人 Webhook 通知"""
 
     def __init__(self, webhook_url: str = FEISHU_WEBHOOK_URL):
         self.webhook_url = webhook_url
 
     def _build_card(self, results: list[PremiumResult]) -> dict:
-        """鏋勫缓椋炰功娑堟伅鍗＄墖"""
+        """构建飞书消息卡片"""
         alert_results = [r for r in results if r.is_alert and not r.error]
         normal_results = [r for r in results if not r.is_alert and not r.error]
         error_results = [r for r in results if r.error]
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 鏋勫缓鍗＄墖鍐呭
+        # 构建卡片内容
         elements = [
             {
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": f"馃搳 **LOF/ETF 婧环鐜囩洃鎺ф姤鍛?*\n馃晲 {now_str}",
+                    "content": f"**LOF/ETF 溢价率监控报告**\n{now_str}",
                 },
             },
             {"tag": "hr"},
         ]
 
         if alert_results:
-            alert_lines = ["**鈿狅笍 婧环鐜囦綆浜庨槇鍊硷紙闇€鍏虫敞锛夛細**\n"]
+            alert_lines = ["**溢价率低于阈值（需关注）：**\n"]
             for r in alert_results:
                 alert_lines.append(
-                    f"鈥?**{r.name}**锛坽r.code}锛塡n"
-                    f"  鐜颁环 {r.last_price:.3f} | 鍙傝€冨噣鍊?{r.ref_nav:.4f} | "
-                    f"婧环鐜?**{r.premium_pct:+.2f}%** | 闃堝€?{r.threshold}%"
+                    f"  **{r.name}**（{r.code}）\n"
+                    f"  现价 {r.last_price:.3f} | 参考净值 {r.ref_nav:.4f} | "
+                    f"溢价率 **{r.premium_pct:+.2f}%** | 阈值 {r.threshold}%"
                 )
             elements.append({
                 "tag": "div",
@@ -454,11 +484,11 @@ class FeishuNotifier:
             })
 
         if normal_results:
-            normal_lines = ["\n**姝ｅ父鏍囩殑锛?*\n"]
+            normal_lines = ["\n**正常标的：**\n"]
             for r in normal_results:
-                direction = "婧环" if r.premium_pct > 0 else "鎶樹环"
+                direction = "溢价" if r.premium_pct > 0 else "折价"
                 normal_lines.append(
-                    f"鈥?{r.name}锛坽r.code}锛夋孩浠风巼 {r.premium_pct:+.2f}%锛坽direction}锛?
+                    f"  {r.name}（{r.code}）溢价率 {r.premium_pct:+.2f}%（{direction}）"
                 )
             elements.append({
                 "tag": "div",
@@ -466,9 +496,9 @@ class FeishuNotifier:
             })
 
         if error_results:
-            error_lines = ["\n**鉂?鏌ヨ寮傚父锛?*\n"]
+            error_lines = ["\n**查询异常：**\n"]
             for r in error_results:
-                error_lines.append(f"鈥?{r.name}锛坽r.code}锛? {r.error}")
+                error_lines.append(f"  {r.name}（{r.code}）: {r.error}")
             elements.append({
                 "tag": "div",
                 "text": {"tag": "lark_md", "content": "\n".join(error_lines)},
@@ -480,7 +510,7 @@ class FeishuNotifier:
                 "header": {
                     "title": {
                         "tag": "plain_text",
-                        "content": "LOF/ETF 婧环鐜囩洃鎺?,
+                        "content": "LOF/ETF 溢价率监控",
                     },
                     "template": "red" if alert_results else "green",
                 },
@@ -489,14 +519,14 @@ class FeishuNotifier:
         }
 
     def send(self, results: list[PremiumResult]) -> bool:
-        """鍙戦€侀涔﹂€氱煡"""
+        """发送飞书通知"""
         if not self.webhook_url:
-            logger.warning("鏈厤缃涔?Webhook URL锛岃烦杩囬€氱煡")
+            logger.warning("未配置飞书 Webhook URL，跳过通知")
             return False
 
         alert_count = sum(1 for r in results if r.is_alert and not r.error)
         if alert_count == 0:
-            logger.info("鏃犲憡璀︽爣鐨勶紝璺宠繃椋炰功閫氱煡")
+            logger.info("无告警标的，跳过飞书通知")
             return True
 
         card = self._build_card(results)
@@ -510,22 +540,22 @@ class FeishuNotifier:
             resp.raise_for_status()
             resp_data = resp.json()
             if resp_data.get("code") == 0:
-                logger.info(f"椋炰功閫氱煡鍙戦€佹垚鍔燂紙{alert_count} 涓憡璀︽爣鐨勶級")
+                logger.info(f"飞书通知发送成功（{alert_count} 个告警标的）")
                 return True
             else:
-                logger.error(f"椋炰功閫氱煡澶辫触: {resp_data}")
+                logger.error(f"飞书通知失败: {resp_data}")
                 return False
         except requests.RequestException as e:
-            logger.error(f"椋炰功閫氱煡璇锋眰寮傚父: {e}")
+            logger.error(f"飞书通知请求异常: {e}")
             return False
 
 
 # ============================================================
-# 鐩戞帶涓婚€昏緫
+# 监控主逻辑
 # ============================================================
 
 class Monitor:
-    """婧环鐜囩洃鎺т富鎺у埗鍣?""
+    """溢价率监控主控制器"""
 
     def __init__(
         self,
@@ -539,9 +569,9 @@ class Monitor:
         self.last_alert_time: dict[str, float] = {}  # code -> last alert timestamp
 
     def run_once(self, verbose: bool = True) -> list[PremiumResult]:
-        """鎵ц涓€娆℃娴?""
+        """执行一次检测"""
         codes = [item["code"] for item in self.monitor_list]
-        msg = f"馃攳 寮€濮嬫娴?{len(codes)} 涓爣鐨? {codes}"
+        msg = f"开始检测 {len(codes)} 个标的: {codes}"
         logger.info(msg)
         if verbose:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -549,9 +579,9 @@ class Monitor:
         try:
             snapshots = self.futu.get_snapshots(codes)
         except Exception as e:
-            logger.error(f"鑾峰彇蹇収澶辫触: {e}")
+            logger.error(f"获取快照失败: {e}")
             if verbose:
-                print(f"  鉂?琛屾儏杩炴帴澶辫触: {e}", flush=True)
+                print(f"  !! 行情连接失败: {e}", flush=True)
             return [
                 PremiumResult(
                     code=item["code"], name=item["name"],
@@ -559,7 +589,7 @@ class Monitor:
                     threshold=item.get("threshold", 2.0),
                     last_price=0, ref_nav=0, nav_field="",
                     premium_pct=0, is_alert=False, update_time="",
-                    error=f"琛屾儏杩炴帴澶辫触: {e}",
+                    error=f"行情连接失败: {e}",
                 )
                 for item in self.monitor_list
             ]
@@ -576,7 +606,7 @@ class Monitor:
                     threshold=item.get("threshold", 2.0),
                     last_price=0, ref_nav=0, nav_field="",
                     premium_pct=0, is_alert=False, update_time="",
-                    error="鏈幏鍙栧埌蹇収鏁版嵁",
+                    error="未获取到快照数据",
                 )
                 results.append(r)
                 for line in r.detail_lines():
@@ -586,99 +616,104 @@ class Monitor:
             result = self.calculator.calculate(code, name, row, item)
             results.append(result)
             logger.info(result.summary())
-            # 姣忎釜鏍囩殑閮借緭鍑鸿缁嗙殑澶氳淇℃伅
+            # 每个标的都输出详细的多行信息
             for line in result.detail_lines():
                 print(line, flush=True)
 
-        print("", flush=True)  # 绌鸿鍒嗛殧
+        print("", flush=True)  # 空行分隔
         return results
 
     def send_alerts(self, results: list[PremiumResult]):
-        """鍙戦€佸憡璀﹂€氱煡"""
+        """发送告警通知"""
         alert_results = [r for r in results if r.is_alert and not r.error]
         if alert_results:
-            print(f"  馃摛 鍙戦€侀涔﹂€氱煡锛坽len(alert_results)} 涓憡璀︽爣鐨勶級...", flush=True)
+            print(f"  发送飞书通知（{len(alert_results)} 个告警标的）...", flush=True)
             self.notifier.send(results)
         else:
-            msg = "鏈妫€娴嬫棤鍛婅"
+            msg = "本次检测无告警"
             logger.info(msg)
-            print(f"  鉁?{msg}", flush=True)
+            print(f"  OK {msg}", flush=True)
 
     def run_loop(self, interval: int = 60):
-        """寰幆鐩戞帶妯″紡"""
-        msg = f"馃殌 鍚姩寰幆鐩戞帶锛岄棿闅?{interval} 绉掞紝鎸?Ctrl+C 鍋滄"
+        """循环监控模式"""
+        msg = f"启动循环监控，间隔 {interval} 秒，按 Ctrl+C 停止"
         logger.info(msg)
         print(f"\n{'=' * 60}")
         print(msg)
         print(f"{'=' * 60}")
-        # 鎵撳嵃鐩戞帶鍒楄〃
-        print(f"\n馃搵 鐩戞帶鏍囩殑锛堝叡 {len(self.monitor_list)} 涓級锛?)
+        # 打印监控列表
+        print(f"\n监控标的（共 {len(self.monitor_list)} 个）：")
         for item in self.monitor_list:
-            print(f"  鈥?{item['code']}  {item['name']}锛坽item.get('type', 'LOF')}锛夐槇鍊?{item.get('threshold', 2.0)}%")
+            print(f"  - {item['code']}  {item['name']}（{item.get('type', 'LOF')}）阈值 {item.get('threshold', 2.0)}%")
         print(f"\n{'=' * 60}\n", flush=True)
 
         cycle = 0
         try:
             while True:
                 cycle += 1
-                print(f"--- 绗?{cycle} 杞娴?[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ---", flush=True)
+                print(f"--- 第 {cycle} 轮检测 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ---", flush=True)
                 results = self.run_once()
                 self.send_alerts(results)
-                print(f"馃挙 绛夊緟 {interval} 绉掑悗杩涜绗?{cycle + 1} 杞娴?..\n", flush=True)
+                print(f"等待 {interval} 秒后进行第 {cycle + 1} 轮检测...\n", flush=True)
                 time.sleep(interval)
         except KeyboardInterrupt:
-            print(f"\n馃洃 鐩戞帶宸插仠姝紝鍏辨墽琛?{cycle} 杞娴?, flush=True)
-            logger.info("鐩戞帶宸插仠姝?)
+            print(f"\n监控已停止，共执行 {cycle} 轮检测", flush=True)
+            logger.info("监控已停止")
         finally:
             self.futu.close()
 
 
 # ============================================================
-# 鍛戒护琛屽叆鍙?# ============================================================
+# 命令行入口
+# ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LOF/ETF 婧环鐜囧疄鏃剁洃鎺?,
+        description="LOF/ETF 溢价率实时监控",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-閰嶇疆璇存槑:
-  鐩戞帶鏍囩殑鍒楄〃鍦?config.yml 涓淮鎶わ紝淇敼鍚?docker-compose restart 鍗冲彲鐢熸晥锛?  鏃犻渶閲嶆柊鏋勫缓 Docker 闀滃儚銆?
-config.yml 绀轰緥 (鍙緭 6 浣嶄唬鐮佸嵆鍙紝鑷姩鎺ㄦ柇 SZ/SH 鍜?LOF/ETF):
+配置说明:
+  监控标的列表在 config.yml 中维护，修改后 docker-compose restart 即可生效，
+  无需重新构建 Docker 镜像。
+
+config.yml 示例 (只输 6 位代码即可，自动推断 SZ/SH 和 LOF/ETF):
   webhook_url: "XXX"
   monitor_list:
-    - "160644"       # 绾唬鐮?鈥?鑷姩璇嗗埆
-    - code: "513050" # 灞曞紑鍐欐硶锛岃嚜瀹氫箟鍚嶇О
-      name: "鏄撴柟杈句腑姒備簰鑱擡TF"
+    - "160644"       # 纯代码 -- 自动识别
+    - code: "513050" # 展开写法，自定义名称
+      name: "易方达中概互联ETF"
       threshold: 2.0
 
-浣跨敤绀轰緥:
-  python monitor.py                       # 鍗曟妫€娴嬶紙浣跨敤榛樿 config.yml锛?  python monitor.py --config my.yml       # 鎸囧畾閰嶇疆鏂囦欢
-  python monitor.py --loop 60             # 姣?0绉掑惊鐜娴?  python monitor.py --json --no-notify    # JSON杈撳嚭锛屼笉鍙戦€氱煡
+使用示例:
+  python monitor.py                       # 单次检测（使用默认 config.yml）
+  python monitor.py --config my.yml       # 指定配置文件
+  python monitor.py --loop 60             # 每60秒循环检测
+  python monitor.py --json --no-notify    # JSON输出，不发通知
         """,
     )
     parser.add_argument(
         "--config", type=str, default=None,
-        help="閰嶇疆鏂囦欢璺緞锛圷AML/JSON 鏍煎紡锛岄粯璁? 鑴氭湰鍚岀洰褰?config.yml锛?,
+        help="配置文件路径（YAML/JSON 格式，默认: 脚本同目录 config.yml）",
     )
     parser.add_argument(
         "--loop", type=int, default=0,
-        help="寰幆妫€娴嬫ā寮忥紝鎸囧畾闂撮殧绉掓暟锛堥粯璁? 0=鍗曟锛?,
+        help="循环检测模式，指定间隔秒数（默认: 0=单次）",
     )
     parser.add_argument(
         "--json", action="store_true",
-        help="JSON 鏍煎紡杈撳嚭缁撴灉",
+        help="JSON 格式输出结果",
     )
     parser.add_argument(
         "--no-notify", action="store_true",
-        help="绂佺敤椋炰功閫氱煡锛堜粎鎵撳嵃缁撴灉锛?,
+        help="禁用飞书通知（仅打印结果）",
     )
     parser.add_argument(
         "--webhook", type=str, default=None,
-        help="椋炰功 Webhook URL锛堣鐩栭厤缃枃浠朵腑鐨勫€硷級",
+        help="飞书 Webhook URL（覆盖配置文件中的值）",
     )
     args = parser.parse_args()
 
-    # ---- 鍔犺浇閰嶇疆鏂囦欢 ----
+    # ---- 加载配置文件 ----
     global FEISHU_WEBHOOK_URL, MONITOR_LIST
 
     config_path = _resolve_config_path(args.config)
@@ -686,17 +721,19 @@ config.yml 绀轰緥 (鍙緭 6 浣嶄唬鐮佸嵆鍙紝鑷姩鎺ㄦ柇 
         cfg = _load_config_file(config_path)
         MONITOR_LIST = cfg["monitor_list"]
         FEISHU_WEBHOOK_URL = cfg.get("webhook_url", DEFAULT_WEBHOOK_URL)
-        print(f"馃搫 宸插姞杞介厤缃枃浠? {config_path}锛坽len(MONITOR_LIST)} 涓爣鐨勶級", flush=True)
+        print(f"已加载配置文件: {config_path}（{len(MONITOR_LIST)} 个标的）", flush=True)
     except FileNotFoundError:
-        print(f"鈿狅笍  閰嶇疆鏂囦欢涓嶅瓨鍦? {config_path}锛屼娇鐢ㄥ唴缃粯璁ら厤缃?, flush=True)
+        print(f"  配置文件不存在: {config_path}，使用内置默认配置", flush=True)
     except (json.JSONDecodeError, ValueError, yaml.YAMLError) as e:
-        print(f"鈿狅笍  閰嶇疆鏂囦欢瑙ｆ瀽澶辫触: {e}锛屼娇鐢ㄥ唴缃粯璁ら厤缃?, flush=True)
+        print(f"  配置文件解析失败: {e}，使用内置默认配置", flush=True)
 
-    # 鐜鍙橀噺瑕嗙洊 webhook锛堟渶楂樹紭鍏堢骇锛?    webhook_env = os.environ.get("FEISHU_WEBHOOK_URL")
+    # 环境变量覆盖 webhook（最高优先级）
+    webhook_env = os.environ.get("FEISHU_WEBHOOK_URL")
     if webhook_env:
         FEISHU_WEBHOOK_URL = webhook_env
 
-    # 鍛戒护琛?--webhook 瑕嗙洊锛堟渶楂樹紭鍏堢骇锛?    webhook = args.webhook or FEISHU_WEBHOOK_URL
+    # 命令行 --webhook 覆盖（最高优先级）
+    webhook = args.webhook or FEISHU_WEBHOOK_URL
 
     monitor = Monitor(webhook_url=webhook if not args.no_notify else "")
 
@@ -724,7 +761,7 @@ config.yml 绀轰緥 (鍙緭 6 浣嶄唬鐮佸嵆鍙紝鑷姩鎺ㄦ柇 
             print(json.dumps(output, ensure_ascii=False, indent=2))
         else:
             print("\n" + "=" * 70)
-            print("LOF/ETF 婧环鐜囨娴嬬粨鏋?)
+            print("LOF/ETF 溢价率检测结果")
             print("=" * 70)
             for r in results:
                 print(f"  {r.summary()}")
@@ -732,9 +769,9 @@ config.yml 绀轰緥 (鍙緭 6 浣嶄唬鐮佸嵆鍙紝鑷姩鎺ㄦ柇 
 
             alert_count = sum(1 for r in results if r.is_alert and not r.error)
             if alert_count > 0:
-                print(f"\n鈿狅笍 鍏?{alert_count} 涓爣鐨勬孩浠风巼浣庝簬闃堝€硷紝闇€瑕佸叧娉紒")
+                print(f"\n共 {alert_count} 个标的溢价率低于阈值，需要关注！")
             else:
-                print("\n鉁?鎵€鏈夋爣鐨勬孩浠风巼姝ｅ父銆?)
+                print("\n所有标的溢价率正常。")
 
         if not args.no_notify:
             monitor.send_alerts(results)
