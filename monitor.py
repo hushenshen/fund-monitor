@@ -75,6 +75,70 @@ logging.basicConfig(
 logger = logging.getLogger("fund_monitor")
 
 # ============================================================
+# 代码自动识别：只输 6 位代码，自动判断 SZ/SH 和 LOF/ETF
+# ============================================================
+
+def _is_sh(code: str) -> bool:
+    """判断 A 股代码是否为沪市。6xxxxx → 沪市，其余 → 深市"""
+    return code.startswith("6")
+
+
+def _is_etf(code: str) -> bool:
+    """判断基金代码是否为 ETF（否则视为 LOF）"""
+    sh_etf_prefixes = ("510", "511", "512", "513", "515", "516", "517", "518", "588")
+    sz_etf_prefixes = ("159",)
+    return code.startswith(sh_etf_prefixes + sz_etf_prefixes)
+
+
+def _auto_detect(code: str) -> dict:
+    """
+    根据 6 位代码自动推断富途完整代码和基金类型。
+
+    返回: {"futu_code": "SZ.160644", "market": "SZ", "type": "LOF", "name": ""}
+    """
+    code = str(code).strip()
+    if "." in code:
+        # 已经是完整富途代码，不做自动推断
+        futu_code = code
+        market = code.split(".")[0]
+    else:
+        market = "SH" if _is_sh(code) else "SZ"
+        futu_code = f"{market}.{code}"
+
+    fund_type = "ETF" if _is_etf(code) else "LOF"
+
+    return {"futu_code": futu_code, "market": market, "type": fund_type}
+
+
+def _normalize_item(item) -> dict:
+    """
+    将配置条目标准化为完整格式。
+
+    支持三种写法：
+      1. 纯代码字符串: "160644"
+      2. 带名称的字典: {"code": "160644", "name": "鹏华港美互联网LOF"}
+      3. 完整字典:     {"code": "SZ.160644", "type": "LOF", ...}
+
+    返回完整格式字典，未填字段用自动推断结果 + 默认值补齐。
+    """
+    if isinstance(item, str):
+        item = {"code": item}
+
+    if not isinstance(item, dict) or "code" not in item:
+        raise ValueError(f"配置条目格式错误: {item}")
+
+    detected = _auto_detect(item["code"])
+
+    return {
+        "code": detected["futu_code"],
+        "name": item.get("name", item["code"] if isinstance(item, str) else item.get("code", "")),
+        "threshold": float(item.get("threshold", 2.0)),
+        "type": item.get("type", detected["type"]),
+        "nav_field": item.get("nav_field", "prev_close"),
+    }
+
+
+# ============================================================
 # 配置文件加载
 # ============================================================
 
@@ -93,6 +157,9 @@ def _load_config_file(path: str) -> dict:
         raise ValueError("配置文件为空")
     if "monitor_list" not in cfg or not isinstance(cfg["monitor_list"], list):
         raise ValueError("配置文件缺少 monitor_list 字段或格式错误")
+
+    # 标准化所有条目（自动推断 SZ/SH、LOF/ETF，补齐默认值）
+    cfg["monitor_list"] = [_normalize_item(item) for item in cfg["monitor_list"]]
 
     return cfg
 
@@ -573,19 +640,13 @@ def main():
   监控标的列表在 config.yml 中维护，修改后 docker-compose restart 即可生效，
   无需重新构建 Docker 镜像。
 
-config.yml 示例:
+config.yml 示例 (只输 6 位代码即可，自动推断 SZ/SH 和 LOF/ETF):
   webhook_url: "XXX"
   monitor_list:
-    - code: "SZ.160644"
-      name: "鹏华港美互联网LOF"
-      threshold: 2.0
-      type: "LOF"
-      nav_field: "prev_close"
-    - code: "SH.513050"
+    - "160644"       # 纯代码 — 自动识别
+    - code: "513050" # 展开写法，自定义名称
       name: "易方达中概互联ETF"
       threshold: 2.0
-      type: "ETF"
-      nav_field: "prev_close"
 
 使用示例:
   python monitor.py                       # 单次检测（使用默认 config.yml）

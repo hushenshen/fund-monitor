@@ -1,40 +1,21 @@
-# LOF/ETF 溢价率监控配置文件
-# 修改此文件后 docker-compose restart 即可生效，无需重新构建镜像
+# ============================================================
+# fund-monitor 监控配置
+# ============================================================
+# 修改此文件后 docker-compose restart 即可生效，无需重新构建镜像。
+#
+# 只输 6 位代码即可，脚本自动判断沪市/深市、LOF/ETF。
+# 如果想要自定义名称/阈值/类型，展开为字典格式即可。
 
-# 飞书机器人 Webhook 地址
 webhook_url: "XXX"
 
-# 监控标的列表
-# 字段说明:
-#   code:      富途股票代码（SZ.xxxxxx / SH.xxxxxx）
-#   name:      标的名称（飞书通知中显示）
-#   threshold: 溢价率阈值（%），当前溢价率 < 此值时触发通知
-#   type:      类型，LOF 或 ETF
-#   nav_field: 净值来源（prev_close: 昨收价 / nav: 基金净值 / iopv: 实时参考净值）
-#
-# 溢价率计算公式: (实时交易价 / 参考净值 - 1) × 100%
 monitor_list:
-  - code: "SZ.160644"
-    name: "鹏华港美互联网LOF"
-    threshold: 2.0
-    type: "LOF"
-    nav_field: "prev_close"
+  # ----- 纯代码写法（自动识别 SZ/SH + LOF/ETF）-----
+  - "160644"          # → SZ.160644 鹏华港美互联网LOF
+  - "164824"          # → SZ.164824 工银印度基金LOF
+  - "513050"          # → SH.513050 易方达中概互联ETF
 
-  # ===== 扩展示例（取消注释即可生效）=====
-  # - code: "SZ.161128"
-  #   name: "易方达标普信息科技LOF"
-  #   threshold: 3.0
-  #   type: "LOF"
-  #   nav_field: "prev_close"
-  #
-  # - code: "SZ.164824"
-  #   name: "工银印度基金LOF"
-  #   threshold: 2.5
-  #   type: "LOF"
-  #   nav_field: "prev_close"
-  #
-  # - code: "SH.513050"
-  #   name: "易方达中概互联ETF"
+  # ----- 展开写法（自定义名称、阈值、类型）-----
+  # - code: "160644"
+  #   name: "鹏华港美互联网LOF"
   #   threshold: 2.0
-  #   type: "ETF"
   #   nav_field: "prev_close"
