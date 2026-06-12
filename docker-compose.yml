@@ -1,5 +1,3 @@
-version: "3.8"
-
 # ============================================================
 # fund-monitor — Docker Compose 部署
 # ============================================================
@@ -17,7 +15,7 @@ services:
   monitor:
     image: deeplakehss/fund-monitor:latest
     container_name: fund-monitor
-    restart: unless-stopped
+    restart: always
 
     # 循环监控模式，每60秒检测一次
     command: ["--loop", "60"]
