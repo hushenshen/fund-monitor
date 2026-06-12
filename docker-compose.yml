@@ -6,7 +6,7 @@
 #   宿主机需要运行 OpenD 客户端（默认在 host.docker.internal:11111）
 #
 # 配置说明：
-#   监控标的列表在 config.json 中维护，修改后 docker-compose restart 即可生效，
+#   监控标的列表在 config.yml 中维护，修改后 docker-compose restart 即可生效，
 #   无需重新构建 Docker 镜像。
 #
 # 使用方式：
@@ -25,8 +25,8 @@ services:
     command: ["--loop", "60"]
 
     volumes:
-      # 挂载配置文件，修改 config.json 后 docker-compose restart 即可生效
-      - ./config.json:/app/config.json:ro
+      # 挂载配置文件，修改 config.yml 后 docker-compose restart 即可生效
+      - ./config.yml:/app/config.yml:ro
 
     environment:
       # 飞书 Webhook 地址（可选，config.json 中也支持配置）

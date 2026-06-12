@@ -40,7 +40,7 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 # 依赖自检（启动时检查，给出明确修复指引）
 # ============================================================
 _MISSING_DEPS = []
-for _mod, _pkg in [("futu", "futu-api"), ("requests", "requests")]:
+for _mod, _pkg in [("futu", "futu-api"), ("requests", "requests"), ("yaml", "pyyaml")]:
     try:
         __import__(_mod)
     except ImportError:
@@ -56,6 +56,7 @@ if _MISSING_DEPS:
     sys.exit(1)
 
 import requests  # noqa: E402
+import yaml   # noqa: E402
 from futu import (  # noqa: E402
     OpenQuoteContext,
     RET_OK,
@@ -78,13 +79,18 @@ logger = logging.getLogger("fund_monitor")
 # ============================================================
 
 def _load_config_file(path: str) -> dict:
-    """加载 JSON 配置文件，返回 {webhook_url, monitor_list}"""
+    """加载 YAML/JSON 配置文件，返回 {webhook_url, monitor_list}"""
     if not os.path.isfile(path):
         raise FileNotFoundError(f"配置文件不存在: {path}")
 
     with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+        if path.endswith((".yml", ".yaml")):
+            cfg = yaml.safe_load(f)
+        else:
+            cfg = json.load(f)
 
+    if cfg is None:
+        raise ValueError("配置文件为空")
     if "monitor_list" not in cfg or not isinstance(cfg["monitor_list"], list):
         raise ValueError("配置文件缺少 monitor_list 字段或格式错误")
 
@@ -96,14 +102,19 @@ def _resolve_config_path(cli_arg: str = None) -> str:
     按优先级确定配置文件路径：
     1. 命令行 --config 参数
     2. 环境变量 MONITOR_CONFIG_FILE
-    3. 默认: 脚本同目录下的 config.json
+    3. 默认: 脚本同目录下的 config.yml → config.yaml → config.json
     """
     if cli_arg:
         return cli_arg
     env_path = os.environ.get("MONITOR_CONFIG_FILE")
     if env_path:
         return env_path
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in ("config.yml", "config.yaml", "config.json"):
+        candidate = os.path.join(base, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return os.path.join(base, "config.yml")  # 默认名
 
 
 # ============================================================
@@ -558,25 +569,34 @@ def main():
         description="LOF/ETF 溢价率实时监控",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-配置文件 (config.json) 示例:
-  {
-    "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx",
-    "monitor_list": [
-      {"code":"SZ.160644","name":"鹏华港美互联网LOF","threshold":2.0,"type":"LOF","nav_field":"prev_close"},
-      {"code":"SH.513050","name":"易方达中概互联ETF","threshold":2.0,"type":"ETF","nav_field":"prev_close"}
-    ]
-  }
+配置说明:
+  监控标的列表在 config.yml 中维护，修改后 docker-compose restart 即可生效，
+  无需重新构建 Docker 镜像。
+
+config.yml 示例:
+  webhook_url: "XXX"
+  monitor_list:
+    - code: "SZ.160644"
+      name: "鹏华港美互联网LOF"
+      threshold: 2.0
+      type: "LOF"
+      nav_field: "prev_close"
+    - code: "SH.513050"
+      name: "易方达中概互联ETF"
+      threshold: 2.0
+      type: "ETF"
+      nav_field: "prev_close"
 
 使用示例:
-  python monitor.py                      # 单次检测（使用默认 config.json）
-  python monitor.py --config my.json     # 指定配置文件
-  python monitor.py --loop 60            # 每60秒循环检测
-  python monitor.py --json --no-notify   # JSON输出，不发通知
+  python monitor.py                       # 单次检测（使用默认 config.yml）
+  python monitor.py --config my.yml       # 指定配置文件
+  python monitor.py --loop 60             # 每60秒循环检测
+  python monitor.py --json --no-notify    # JSON输出，不发通知
         """,
     )
     parser.add_argument(
         "--config", type=str, default=None,
-        help="配置文件路径（JSON 格式，默认: 脚本同目录 config.json）",
+        help="配置文件路径（YAML/JSON 格式，默认: 脚本同目录 config.yml）",
     )
     parser.add_argument(
         "--loop", type=int, default=0,
@@ -607,7 +627,7 @@ def main():
         print(f"📄 已加载配置文件: {config_path}（{len(MONITOR_LIST)} 个标的）", flush=True)
     except FileNotFoundError:
         print(f"⚠️  配置文件不存在: {config_path}，使用内置默认配置", flush=True)
-    except (json.JSONDecodeError, ValueError) as e:
+    except (json.JSONDecodeError, ValueError, yaml.YAMLError) as e:
         print(f"⚠️  配置文件解析失败: {e}，使用内置默认配置", flush=True)
 
     # 环境变量覆盖 webhook（最高优先级）
