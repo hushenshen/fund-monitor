@@ -16,9 +16,6 @@ version: "3.8"
 services:
   monitor:
     image: deeplakehss/fund-monitor:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
     container_name: fund-monitor
     restart: unless-stopped
 
