@@ -24,6 +24,9 @@ Thumbs.db
 # Docker
 docker-compose.override.yml
 
+# OpenD RSA 密钥（私钥，勿提交）
+futu.pem
+
 # Logs
 *.log
 logs/

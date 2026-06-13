@@ -7,72 +7,69 @@
 #   monitor  — LOF/ETF 溢价率监控脚本
 #
 # 前置条件：
-#   1. 首次运行 OpenD 需要登录（短信验证）
-#   2. 登录态通过 volume 持久化，后续无需重复登录
+#   1. 生成 RSA 密钥：openssl genrsa -out futu.pem 1024
+#   2. 配置 .env 文件（基于 .env.example）
+#   3. 配置 config.yml（监控标的 + 飞书 Webhook）
+#   4. 首次运行需输入验证码（通过 Telnet 端口 22222）
 #
-# 配置说明：
-#   1. 复制 .env.example 为 .env，填入富途账号密码
-#   2. 监控标的列表在 config.yml 中维护
+# 登录态：通过 opend-data volume 持久化，重启无需重新登录。
 #
 # 使用方式：
-#   docker-compose up -d                # 后台启动所有服务
-#   docker-compose logs -f opend        # 查看 OpenD 日志（首次运行需在此查看验证码）
-#   docker-compose logs -f monitor      # 查看监控日志
-#   docker-compose down                 # 停止并移除容器
-#   docker-compose down -v              # 停止并清除数据（会丢失登录态）
+#   docker compose up -d              # 后台启动
+#   docker compose logs -f opend       # 查看 OpenD 日志
+#   docker compose logs -f monitor     # 查看监控日志
+#   docker compose down                # 停止
+#   docker compose down -v             # 停止并清除数据（丢失登录态）
 # ============================================================
-
-version: "3.8"
-
-networks:
-  fund-net:
-    driver: bridge
 
 services:
   # ----------------------------------------------------------
   # OpenD — 富途行情网关
+  # 镜像来源：https://github.com/manhinhang/futu-opend-docker
   # ----------------------------------------------------------
   opend:
-    # 使用社区维护的 OpenD Docker 镜像
-    # 如需自行构建，参考 opend/ 目录下的 Dockerfile
     image: ghcr.io/manhinhang/futu-opend-docker:ubuntu-stable
     container_name: fund-opend
     restart: always
 
-    networks:
-      - fund-net
+    # 使用 host 网络模式，避免 Docker bridge 导致连接富途认证服务器失败。
+    # 如需使用 bridge 模式，取消 network_mode 注释并启用 ports 映射。
+    network_mode: host
 
-    ports:
-      # OpenD 行情接口（供 monitor 连接）
-      - "11111:11111"
-      # OpenD Telnet 管理端口（可选）
-      - "22222:22222"
+    # 如果不用 host 模式，改用 bridge：
+    # ports:
+    #   - "11111:11111"   # OpenD 行情 API
+    #   - "22222:22222"   # Telnet（验证码输入）
 
     volumes:
+      # RSA 密钥文件（启动前先执行 openssl genrsa -out futu.pem 1024）
+      - ./futu.pem:/.futu/futu.pem:ro
+
       # 持久化登录态（重启后无需重新登录）
       - opend-data:/home/futu/.com.futunn.FutuOpenD
-      # 可选：挂载自定义 FutuOpenD.xml 配置
-      # - ./opend/custom.xml:/home/futu/FutuOpenD.xml:ro
 
     environment:
-      # 富途账号（手机号/邮箱/数字ID）
-      FUTU_ACCOUNT_ID: ${FUTU_ACCOUNT_ID:-}
-      # 富途密码（明文或 MD5）
+      # 富途账号（手机号 / 邮箱 / 数字ID）
+      FUTU_ACCOUNT_ID: ${FUTU_ACCOUNT_ID}
+
+      # 推荐：密码 MD5（避免明文密码泄露在日志/配置中）
+      # 生成方式：echo -n "你的密码" | md5sum | awk '{print $1}'
+      # 如果同时设置了 MD5 和明文，MD5 优先生效
+      FUTU_ACCOUNT_PWD_MD5: ${FUTU_ACCOUNT_PWD_MD5:-}
+
+      # 已弃用（备选）：明文密码，会触发 stderr 警告
       FUTU_ACCOUNT_PWD: ${FUTU_ACCOUNT_PWD:-}
-      # 监听地址（容器内需监听 0.0.0.0 以允许外部访问）
+
+      # OpenD 监听地址和端口
       FUTU_OPEND_IP: "0.0.0.0"
       FUTU_OPEND_PORT: "11111"
+      FUTU_OPEND_TELNET_PORT: "22222"
 
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
-
-    deploy:
-      resources:
-        limits:
-          memory: 512M
 
   # ----------------------------------------------------------
   # monitor — LOF/ETF 溢价率监控
@@ -82,27 +79,20 @@ services:
     container_name: fund-monitor
     restart: always
 
-    networks:
-      - fund-net
+    network_mode: host
 
-    # 循环监控模式，每60秒检测一次
     command: ["--loop", "60"]
 
     volumes:
-      # 挂载配置文件，修改 config.yml 后 docker-compose restart 即可生效
       - ./config.yml:/app/config.yml:ro
-      # 监控日志（可选，方便排查）
       - ./logs:/app/logs
 
     environment:
-      # OpenD 连接地址（通过 Docker 内部网络访问 opend 服务）
-      FUTU_OPEND_HOST: "opend"
+      # 连接同机 OpenD（host 网络模式下用 127.0.0.1）
+      FUTU_OPEND_HOST: "127.0.0.1"
       FUTU_OPEND_PORT: "11111"
-
-      # Python 日志输出不缓冲（Docker 日志实时可见）
       PYTHONUNBUFFERED: "1"
 
-    # 依赖 opend 服务先启动
     depends_on:
       - opend
 
@@ -111,11 +101,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-    deploy:
-      resources:
-        limits:
-          memory: 256M
 
 # ----------------------------------------------------------
 # Volumes
