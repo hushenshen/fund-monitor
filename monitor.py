@@ -334,6 +334,7 @@ class FutuClient:
     def get_snapshots(self, codes: list[str]) -> dict:
         """
         批量获取市场快照。
+        如遇权限不足，自动降级使用 get_stock_quote 获取基础价格数据。
         返回 {code: DataFrame row} 的字典。
 
         注意：富途返回的 code 字段可能不带市场前缀（如 160644），
@@ -341,23 +342,64 @@ class FutuClient:
         """
         ctx = self.connect()
         result = {}
+        permission_denied = []
         batch_size = 400
         for i in range(0, len(codes), batch_size):
             batch = codes[i:i + batch_size]
             ret, data = ctx.get_market_snapshot(batch)
             if ret != RET_OK:
-                logger.error(f"获取快照失败: {data}")
+                err_msg = str(data)
+                logger.warning(f"快照接口失败: {err_msg}")
+                if "无权限" in err_msg or "权限" in err_msg:
+                    permission_denied.extend(batch)
                 continue
             if data is not None and not data.empty:
                 for idx in range(len(data)):
                     row = data.iloc[idx]
                     raw_code = str(row.get("code", ""))
                     short_code = self._normalize_code(raw_code)
-                    # 同时以完整码和短码存储，覆盖不同查询方式
                     result[raw_code] = row
                     if short_code != raw_code:
                         result.setdefault(short_code, row)
+
+        # 降级：快照无权限的标的，改用 get_stock_quote
+        if permission_denied:
+            logger.info(
+                f"{len(permission_denied)} 个标的不支持快照接口，"
+                f"尝试 get_stock_quote 降级: {permission_denied}"
+            )
+            try:
+                ret, quote_data = ctx.get_stock_quote(permission_denied)
+                if ret == RET_OK and quote_data is not None and not quote_data.empty:
+                    for idx in range(len(quote_data)):
+                        row = quote_data.iloc[idx]
+                        raw_code = str(row.get("code", ""))
+                        short_code = self._normalize_code(raw_code)
+                        # get_stock_quote 返回字段名不同，做一下映射
+                        # last_price / prev_close_price 可以直接用
+                        result[raw_code] = row
+                        if short_code != raw_code:
+                            result.setdefault(short_code, row)
+                else:
+                    logger.warning(f"get_stock_quote 降级也失败: {data}")
+            except Exception as e:
+                logger.error(f"get_stock_quote 异常: {e}")
+
         return result
+
+    def query_subscription(self) -> dict:
+        """查询当前账户的行情订阅状态（诊断用）"""
+        ctx = self.connect()
+        try:
+            ret, data = ctx.query_subscription()
+            if ret == RET_OK and data is not None:
+                return data.to_dict(orient="records") if hasattr(data, "to_dict") else {}
+            else:
+                logger.warning(f"查询订阅状态失败: {data}")
+                return {}
+        except Exception as e:
+            logger.error(f"query_subscription 异常: {e}")
+            return {}
 
 
 # ============================================================
@@ -608,6 +650,30 @@ class Monitor:
             logger.error(f"获取快照失败: {e}")
             if verbose:
                 print(f"  !! 行情连接失败: {e}", flush=True)
+            snapshots = {}
+
+        # 如果快照全部失败，打印订阅诊断信息
+        if not snapshots:
+            if verbose:
+                print("  >> 正在查询行情订阅状态...", flush=True)
+            try:
+                sub = self.futu.query_subscription()
+                if sub:
+                    if verbose:
+                        print(f"  当前订阅状态: {sub}", flush=True)
+                        print(
+                            "  >> 可能原因：\n"
+                            "    1. 账号未开通 A 股（沪深）行情权限 — 在富途 App 中「市场行情」开通\n"
+                            "    2. LOF/ETF 需要开通「沪深 Level-2」行情权限\n"
+                            "    3. 使用 Futu International 账号需确认是否支持 A 股 LOF\n"
+                            "    4. 换用 --platform 参数指定平台（如 --platform ft_general）",
+                            flush=True,
+                        )
+                else:
+                    if verbose:
+                        print("  无法查询订阅状态（可能账号类型不支持此接口）", flush=True)
+            except Exception:
+                pass
             return [
                 PremiumResult(
                     code=item["code"], name=item["name"],
