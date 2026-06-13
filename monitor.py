@@ -24,6 +24,7 @@ import argparse
 import json
 import logging
 import os
+import socket
 import sys
 import time
 from dataclasses import dataclass
@@ -294,9 +295,21 @@ class FutuClient:
         self._ctx: Optional[OpenQuoteContext] = None
 
     def connect(self) -> OpenQuoteContext:
-        """建立行情连接"""
+        """建立行情连接（带 10s 超时，避免 OpenD 不可用时无限卡死）"""
         if self._ctx is None:
-            self._ctx = OpenQuoteContext(host=self.host, port=self.port)
+            logger.info(f"正在连接 OpenD: {self.host}:{self.port} ...")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 正在连接 OpenD ({self.host}:{self.port}) ...", flush=True)
+            old_timeout = socket.getdefaulttimeout()
+            try:
+                socket.setdefaulttimeout(10)
+                self._ctx = OpenQuoteContext(host=self.host, port=self.port)
+            except Exception as e:
+                raise ConnectionError(
+                    f"无法连接 OpenD ({self.host}:{self.port})，请确认 OpenD 已启动且端口可访问。"
+                    f" 原始错误: {e}"
+                )
+            finally:
+                socket.setdefaulttimeout(old_timeout)
             logger.info(f"已连接 OpenD: {self.host}:{self.port}")
         return self._ctx
 
